@@ -21,6 +21,8 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	humanize "github.com/dustin/go-humanize"
@@ -32,12 +34,19 @@ import (
 	"github.com/minio/minio/pkg/console"
 )
 
+var adminBwFlags = []cli.Flag{
+	cli.BoolFlag{
+		Name:  "in-bytes",
+		Usage: "Display current bandwidth usage in bytes",
+	},
+}
+
 var adminBwInfoCmd = cli.Command{
 	Name:   "bandwidth",
 	Usage:  "Show bandwidth info for buckets on the MinIO server",
 	Action: mainAdminBwInfo,
 	Before: setGlobalsFromContext,
-	Flags:  globalFlags,
+	Flags:  append(globalFlags, adminBwFlags...),
 	CustomHelpTemplate: `NAME:
   {{.HelpName}} - {{.Usage}}
 
@@ -55,36 +64,24 @@ EXAMPLES:
 `,
 }
 
-// BandwidthDisplayVal - structure that holds info for the user
-// which only shows the data calculated from sampled output
-type BandwidthDisplayVal struct {
-	LimitInBytesPerSecond            int64   `json:"limit"`
-	CurrentBandwidthInBytesPerSecond float64 `json:"currentBandwidth"`
-}
-
-// BandwidthSampleResult - contains Bucket - BandwidthDisplayVal map
-// Sampled from value of all servers
-type BandwidthSampleResult struct {
-	SampleResult map[string]BandwidthDisplayVal
-}
-
 // Wrap single server "Info" message together with fields "Status" and "Error"
 type bandwidthInfoPerBucket struct {
-	Status string                `json:"status"`
-	Error  string                `json:"error,omitempty"`
-	Server string                `json:"server,omitempty"`
-	Bucket string                `json:"bucket,omitempty"`
-	Info   BandwidthSampleResult `json:"info,omitempty"`
+	Status string                       `json:"status"`
+	Error  string                       `json:"error,omitempty"`
+	Server string                       `json:"server,omitempty"`
+	Bucket string                       `json:"bucket,omitempty"`
+	Info   map[string]bandwidth.Details `json:"info,omitempty"`
 }
 
 func (b bandwidthInfoPerBucket) String() (msg string) {
 	if b.Status == "error" {
 		fatal(probe.NewError(errors.New(b.Error)), "Unable to get service status")
 	}
+
 	// Color palette initialization
 	console.SetColor("Info", color.New(color.FgGreen, color.Bold))
 	msg += fmt.Sprintf("%s  %s\n", console.Colorize("Info", dot), console.Colorize("PrintB", b.Server))
-	for bucket, sample := range b.Info.SampleResult {
+	for bucket, sample := range b.Info {
 		limitStr := fmt.Sprintf("%d", sample.LimitInBytesPerSecond)
 		curStr := fmt.Sprintf("%.4f", sample.CurrentBandwidthInBytesPerSecond)
 		msg += fmt.Sprintf("   Bucket: %s\n", console.Colorize("Info", bucket))
@@ -97,56 +94,67 @@ func (b bandwidthInfoPerBucket) String() (msg string) {
 func (b bandwidthInfoPerBucket) JSON() string {
 	statusJSONBytes, e := json.MarshalIndent(b, "", "    ")
 	fatalIf(probe.NewError(e), "Unable to marshal into JSON.")
-
 	return string(statusJSONBytes)
 }
 
 // getBandwidthDataBucket For the given server & the bucket in the server fetch a sample collection of bandwidth details
 // Return for the samples obtained arrange them bucket - array of details, error if any.
-func getBandwidthDataBucket(server string, bucket string) (bwSampleCollection map[string][]bandwidth.Details, err error) {
-	sampleCount := 1
-	client, pErr := newAdminClient(server)
-	bwSampleCollection = make(map[string][]bandwidth.Details)
+func getBandwidthDataBucket(server string, bucket string) (map[string]bandwidth.Details, error) {
+	client, err := newAdminClient(server)
+	fatalIf(err.Trace(), "Unable to initialize admin connection")
 	var buckets []string
 	var bwRep bandwidth.Report
+	var e error
 	buckets = append(buckets, bucket)
-	for index := 0; index < sampleCount; index++ {
-		fatalIf(pErr, "Unable to initialize admin connection with "+server)
-		if bwRep, err = client.GetBucketBandwidth(globalContext, buckets...); err != nil {
-			return nil, err
-		}
-		for bucket, elem := range bwRep.BucketStats {
-			if details, ok := bwSampleCollection[bucket]; !ok {
-				var detailArr []bandwidth.Details
-				detailArr = append(detailArr, elem)
-				bwSampleCollection[bucket] = detailArr
-			} else {
-				details = append(details, elem)
-				bwSampleCollection[bucket] = details
-			}
-		}
+	if bwRep, e = client.GetBucketBandwidth(globalContext, buckets...); e != nil {
+		return nil, e
 	}
-	return bwSampleCollection, err
+	return bwRep.BucketStats, nil
 }
 
-// buildSampleTableDataBucket - The display table is arranged per bucket.
-func buildSampleTableDataBucket(bwSampleCollection map[string][]bandwidth.Details) map[string]BandwidthDisplayVal {
-	bwDisplayCollection := make(map[string]BandwidthDisplayVal)
-	for bucket, sampleArr := range bwSampleCollection {
-		for _, sample := range sampleArr {
-			bwDisplayCollection[bucket] = BandwidthDisplayVal{
-				LimitInBytesPerSecond:            sample.LimitInBytesPerSecond,
-				CurrentBandwidthInBytesPerSecond: sample.CurrentBandwidthInBytesPerSecond,
-			}
-		}
-	}
-	return bwDisplayCollection
+func getBandwidthTableValues(server string, targetURL string) map[string]bandwidth.Details {
+	bwSampleCollection, err := getBandwidthDataBucket(server, targetURL)
+	fatalIf(probe.NewError(err), "Unable to fetch bandwidth data for "+targetURL)
+	return bwSampleCollection
 }
 
-// printTable - Prints the table.
-func printTable(bwDisplaySample map[string]BandwidthDisplayVal) {
-	// bucket name. Max length 16. Min is 6.
-	bucketMaxLength := 16
+// getBandwidthBitDisplay - If displaying bits per second
+// conversion needs to be done.
+func getBandwidthBitDisplay(valueByteStr string, cellLength int) string {
+	valArr := strings.Split(valueByteStr, " ")
+	if cellLength <= 0 {
+		cellLength = 25
+	}
+	var valBits float64
+	var e error
+	var valBitsStr string
+	if len(valArr) < 2 {
+		return valueByteStr
+	}
+	if strings.Compare(valArr[0], "0") == 0 {
+		valBitsStr = "0 "
+	} else {
+		if valBits, e = strconv.ParseFloat(valArr[0], 64); e != nil {
+			return valueByteStr
+		}
+		valBits *= 8
+		valBitsStr = strconv.FormatFloat(valBits, 'f', -1, 64)
+		valDisplay := strings.ReplaceAll(valArr[1], "B", "")
+		valBitsStr = strings.Join([]string{
+			valBitsStr,
+			valDisplay,
+		},
+			" ")
+	}
+	// Center align
+	valBitsStr = fmt.Sprintf(fmt.Sprintf("%%-%ds", (cellLength/2)-2), fmt.Sprintf(fmt.Sprintf("%%%ds", (cellLength/2)+2), valBitsStr))
+	return valBitsStr
+}
+
+// printBandwidthTable - Prints the table.
+func printBandwidthTable(bwDisplaySample map[string]bandwidth.Details, withBytes bool) {
+	// bucket name. Max length 25. Min is 6.
+	bucketMaxLength := 25
 	bucketColLength := 6
 	var bucketKeys []string
 	for bucket := range bwDisplaySample {
@@ -166,15 +174,18 @@ func printTable(bwDisplaySample map[string]BandwidthDisplayVal) {
 	for _, c := range dspOrder {
 		printColors = append(printColors, getPrintCol(c))
 	}
-
 	// Table cell initialization of the header for the table.
 	cellText := make([][]string, len(bwDisplaySample)+1) // 1 for the header
-	tbl := console.NewTable(printColors, []bool{false, false, false}, 5)
-	bucketTitle := fmt.Sprintf("%-16v", "Bucket")
+	tbl := console.NewTable(printColors, []bool{false, false, false}, 16)
+	bucketTitle := fmt.Sprintf("%-25v", "Bucket")
+	rateTitle := "(bits per second)"
+	if withBytes {
+		rateTitle = "(bytes per second)"
+	}
 	cellText[0] = []string{
 		bucketTitle,
-		"Limit      ",
-		"Current Bandwidth",
+		"Limit " + rateTitle,
+		"Current Bandwidth " + rateTitle,
 	}
 	// Header separator between header & rows.
 	tbl.HeaderRowSeparator = true
@@ -183,13 +194,24 @@ func printTable(bwDisplaySample map[string]BandwidthDisplayVal) {
 	// Initialize row/column cell values
 	for _, bucket := range bucketKeys {
 		values := bwDisplaySample[bucket]
+		limitStr := humanize.Bytes(uint64(values.LimitInBytesPerSecond * 8))
+		curBwStr := humanize.Bytes(uint64(values.CurrentBandwidthInBytesPerSecond * 8))
+		if !withBytes {
+			limitStr = getBandwidthBitDisplay(limitStr, 25)
+			curBwStr = getBandwidthBitDisplay(curBwStr, 37)
+		} else {
+			limitStr = strings.ReplaceAll(limitStr, "B", "")
+			curBwStr = strings.ReplaceAll(curBwStr, "B", "")
+			limitStr = fmt.Sprintf("%-12s", fmt.Sprintf("%12s", limitStr))
+			curBwStr = fmt.Sprintf("%-15s", fmt.Sprintf("%17s", curBwStr))
+		}
 		if len(bucket) > bucketMaxLength {
-			bucket = bucket[:12] + ".."
+			bucket = bucket[:23] + ".."
 		}
 		cellText[index] = []string{
 			bucket,
-			humanize.IBytes(uint64(values.LimitInBytesPerSecond)),
-			humanize.IBytes(uint64(values.CurrentBandwidthInBytesPerSecond)),
+			limitStr,
+			curBwStr,
 		}
 		index++
 	}
@@ -199,6 +221,23 @@ func printTable(bwDisplaySample map[string]BandwidthDisplayVal) {
 		tbl.DisplayTable(cellText)
 	}
 }
+
+func showBandwidthJSON(server string, targetURL string, bwDisp map[string]bandwidth.Details) {
+	var bwInfo bandwidthInfoPerBucket
+	bwInfo.Info = bwDisp
+	bwInfo.Server = server
+	bwInfo.Bucket = targetURL
+	printMsg(bandwidthInfoPerBucket(bwInfo))
+	console.Println()
+}
+
+func showBandwidthValues(withBytes bool, rewindLines int, bwDisp map[string]bandwidth.Details) {
+	if len(bwDisp) > 0 {
+		console.RewindLines(rewindLines)
+		printBandwidthTable(bwDisp, withBytes)
+	}
+}
+
 func checkAdminBwInfoSyntax(ctx *cli.Context) {
 	if len(ctx.Args()) > 1 || len(ctx.Args()) == 0 {
 		cli.ShowCommandHelpAndExit(ctx, "bandwidth", globalErrorExitStatus)
@@ -209,10 +248,18 @@ func mainAdminBwInfo(ctx *cli.Context) error {
 	checkAdminBwInfoSyntax(ctx)
 	args := ctx.Args()
 	server := args.Get(0)
-	console.PrintC(console.Colorize("BlinkLoad", "Fetching bandwidth data...\n"))
 	_, targetURL := url2Alias(args[0])
-	rewindLines := 1
+
 	firstPrint := true
+	rewindLines := 1
+	withBytes := ctx.Bool("in-bytes")
+	if globalJSON {
+		bwDispVal := getBandwidthTableValues(server, targetURL)
+		showBandwidthJSON(server, targetURL, bwDispVal)
+		return nil
+	}
+
+	console.PrintC(console.Colorize("BlinkLoad", "Fetching bandwidth data...\n"))
 	for {
 		// In for loop fetch bandwidth data( for all buckets or just one bucket).
 		select {
@@ -220,30 +267,15 @@ func mainAdminBwInfo(ctx *cli.Context) error {
 			// Exit for Ctrl-c
 			os.Exit(0)
 		default:
-			// Get Sample Collection of bandwidth data for a bucket.
-			bwSampleCollection, err := getBandwidthDataBucket(server, targetURL)
-			fatalIf(probe.NewError(err), "Unable to fetch bandwidth data for "+args[0])
-			bwBucketDispVal := buildSampleTableDataBucket(bwSampleCollection)
-			if globalJSON {
-				var bwInfo bandwidthInfoPerBucket
-				bwInfo.Info.SampleResult = bwBucketDispVal
-				bwInfo.Server = server
-				bwInfo.Bucket = targetURL
-				printMsg(bandwidthInfoPerBucket(bwInfo))
-				console.Println()
-			} else {
-				if len(bwBucketDispVal) > 0 {
-					console.RewindLines(rewindLines)
-					// For the next iteration, rewind lines
-					rewindLines = len(bwBucketDispVal) + 4
-					printTable(bwBucketDispVal)
-					firstPrint = false
-				} else {
-					rewindLines = 0
-					if firstPrint {
-						rewindLines = 1
-					}
-				}
+			bwDispVal := getBandwidthTableValues(server, targetURL)
+			// show table (or JSON), sleep for 1 second before getting sample values again for display
+			showBandwidthValues(withBytes, rewindLines, bwDispVal)
+			firstPrint = firstPrint && (len(bwDispVal) == 0)
+			// Calculate # of rewind lines for next iteration
+			if len(bwDispVal) > 0 {
+				rewindLines = len(bwDispVal) + 4
+			} else if !firstPrint {
+				rewindLines = 0
 			}
 			time.Sleep(1 * time.Second)
 		}
